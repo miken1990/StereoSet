@@ -7,6 +7,7 @@ from collections import defaultdict
 import numpy as np
 import dataloader
 
+
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--gold-file", required=True)
@@ -14,6 +15,7 @@ def parse_args():
     parser.add_argument("--predictions-dir", default=None)
     parser.add_argument("--output-file", default=None)
     return parser.parse_args()
+
 
 class ScoreEvaluator(object):
     def __init__(self, gold_file_path, predictions_file_path):
@@ -159,7 +161,7 @@ def parse_file(gold_file, predictions_file):
         predictions_dir = args.predictions_dir
         if predictions_dir[-1]=="/":
             predictions_dir = predictions_dir[:-1]
-        output_file = f"{predictions_dir}.json"
+        output_file = f"{predictions_dir}_{predictions_file.split('_')[-1].split('.')[0]}.json"
     else:
         output_file = "results.json"
 
@@ -180,6 +182,7 @@ def parse_file(gold_file, predictions_file):
     with open(output_file, "w+") as f:
         json.dump(d, f, indent=2)
 
+
 if __name__ == "__main__":
     args = parse_args()
     assert (args.predictions_file) != (args.predictions_dir)
@@ -192,4 +195,6 @@ if __name__ == "__main__":
             print(f"Evaluating {prediction_file}...")
             parse_file(args.gold_file, prediction_file) 
     else:
-        parse_file(args.gold_file, args.predictions_file) 
+        parse_file(args.gold_file, args.predictions_file)
+
+        #TODO: michael - this file contains evaluation of predictions file

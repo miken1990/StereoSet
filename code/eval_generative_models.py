@@ -3,13 +3,16 @@ import os
 from argparse import ArgumentParser
 from collections import Counter
 from random import shuffle
-
+from collections import defaultdict
+from functools import partial
 import numpy as np
+import pandas as pd
 import torch
 import transformers
 from colorama import Back, Fore, Style, init
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from attention_intervention_model import AttentionOverride
 
 import dataloader
 from intersentence_loader import IntersentenceDataset
@@ -47,6 +50,8 @@ def parse_args():
     parser.add_argument("--skip-intrasentence",
                         default=False, action="store_true", help="SKip the intrasentence task.")
     parser.add_argument("--small", default=False, action="store_true")
+    parser.add_argument("--erase-top-k", type=int, default=0)
+    parser.add_argument("--neurons-eff-path", type=str, default=None)
     return parser.parse_args()
 
 
@@ -55,7 +60,7 @@ class BiasEvaluator(object):
                  intrasentence_model="GPT2LM", intrasentence_load_path=None, intersentence_model="ModelNSP",
                  intersentence_load_path=None, tokenizer="GPT2Tokenizer", unconditional_start_token="<|endoftext|>",
                  skip_intrasentence=False, skip_intersentence=False, max_seq_length=64, small=False,
-                 output_dir="predictions/"):
+                 output_dir="predictions/", erase_top_k=0, neurons_eff_path=None):
         print(f"Loading {input_file}...")
         self.BATCH_SIZE = batch_size
         filename = os.path.abspath(input_file)
@@ -76,6 +81,8 @@ class BiasEvaluator(object):
         self.INTERSENTENCE_MODEL = intersentence_model
         self.INTERSENTENCE_LOAD_PATH = intersentence_load_path
         self.max_seq_length = max_seq_length
+        self.erase_top_k = erase_top_k
+        self.attn_eff_path = neurons_eff_path
 
         print("---------------------------------------------------------------")
         print(
@@ -95,6 +102,110 @@ class BiasEvaluator(object):
         print(f"{Fore.LIGHTCYAN_EX}CUDA:{Style.RESET_ALL} {self.cuda}")
         print("---------------------------------------------------------------")
 
+    def register_erase_hooks_neurons(self, model, layer_neuron_dict):
+        for layer, neurons in layer_neuron_dict.items():
+            if layer == -1:
+                model.transformer.wte.register_forward_hook(
+                    partial(
+                        self.erase_neuron_embedding_hook,
+                        indexes=neurons
+                    )
+                )
+            else:
+                model.transformer.h[layer].register_forward_hook(
+                    partial(
+                        self.erase_neuron_mlp_hook,
+                        indexes=neurons
+                    )
+                )
+
+    def register_erase_hooks_attn(self, model, layer_attn_dict):
+        for layer, attn_head_idx in layer_attn_dict.items():
+            model.transformer.h[layer].attn.register_forward_hook(
+                partial(self.erase_attn_hook,
+                        indexes=attn_head_idx,
+                        device=self.device))
+
+    def get_layer_neurons_topk_dict(self):
+        df = pd.read_csv(self.attn_eff_path, index_col=0)
+        # df = df.sort_values(by=["total_causal_effect_mean"], ascending=False)
+        df = df.sort_values(by=["odds_ratio_indirect_mean"], ascending=False)
+        layer_neuron_dict = defaultdict(list)
+        for ind, neuron_loc in df[:self.erase_top_k]["neuron_"].iteritems():
+            layer_str, neuron_str = neuron_loc.split('-')
+            layer_neuron_dict[int(layer_str) - 1].append(int(neuron_str))
+
+        return layer_neuron_dict
+
+    def get_layer_neurons_topk_dict_per_layer(self):
+        df = pd.read_csv(self.attn_eff_path, index_col=0)
+        # df = df.sort_values(by=["total_causal_effect_mean"], ascending=False)
+        df = df.sort_values(by=["odds_ratio_indirect_mean"], ascending=False)
+        layer_neuron_dict = defaultdict(list)
+        for i in range(7):
+            relevant_df = df[df.neuron_.str.startswith(str(i) + '-')]
+            for ind, neuron_loc in relevant_df[:self.erase_top_k]["neuron_"].iteritems():
+                layer_str, neuron_str = neuron_loc.split('-')
+                layer_neuron_dict[int(layer_str) - 1].append(int(neuron_str))
+
+        return layer_neuron_dict
+
+    def get_layer_attn_top_k_dict_per_layer(self):
+        data = None
+        with open(self.attn_eff_path) as f:
+            data = json.load(f)
+        # data = pd.read_csv(self.attn_eff_path)
+        results = data['results']
+        df = pd.DataFrame(results)
+
+        # Aggregate by head
+        # Convert column to 3d ndarray (num_examples x num_layers x num_heads)
+        indirect_by_head = np.stack(df['indirect_effect_head'].to_numpy())
+        # Average by head
+        mean_indirect_by_head = indirect_by_head.mean(axis=0)
+
+        # mean_indirect_by_head[np.unravel_index(mean_indirect_by_head.argmax(), mean_indirect_by_head.shape)]
+        indices = (-mean_indirect_by_head).argpartition(self.erase_top_k, axis=None)[:self.erase_top_k]
+        # OR, if you want to avoid the temporary array created by `-full`:
+        # indices = full.argpartition(full.size - num_largest, axis=None)[-num_largest:]
+
+        x, y = np.unravel_index(indices, mean_indirect_by_head.shape)
+
+        layer_attn_dict = {}
+        for xx, yy in zip(x, y):
+            layer_attn_dict[xx] = yy
+
+        return layer_attn_dict
+
+
+
+    @staticmethod
+    def erase_neuron_embedding_hook(module, input, output, indexes):
+        output[:, :, indexes] = 0
+
+    @staticmethod
+    def erase_neuron_mlp_hook(module, input, output, indexes):
+        output_attn = module.attn(module.ln_1(input[0]),
+                                  layer_past=None,
+                                  attention_mask=None,
+                                  head_mask=None)
+
+        a = output_attn[0]
+        x = input[0] + a
+        m = module.mlp(module.ln_2(x))
+        m[:, :, indexes] = 0
+        x = x + m
+        output = [x] + output_attn[1:]
+
+    @staticmethod
+    def erase_attn_hook(module, input, output, indexes, device):
+        attn_mask = torch.zeros((1, module.n_head, input[0].shape[1], input[0].shape[1]), dtype=bool).to(device)
+        attn_mask[:, indexes, :, :] = 1
+        attn_val = torch.zeros((1, module.n_head, input[0].shape[1], input[0].shape[1])).to(device)
+        attention_override_module = AttentionOverride(
+            module, attn_val, attn_mask)
+        output[:] = attention_override_module(*input)
+
     def evaluate_intrasentence(self):
         print()
         print(
@@ -103,6 +214,11 @@ class BiasEvaluator(object):
         model = getattr(models, self.INTRASENTENCE_MODEL)(
             self.PRETRAINED_CLASS).to(self.device)
         model.eval()
+        # TODO:michael - add registration of erase neuron hooks
+
+        if self.erase_top_k > 0:
+            layer_attn_dict = self.get_layer_attn_top_k_dict_per_layer()
+            self.register_erase_hooks_attn(model, layer_attn_dict)
 
         start_token = torch.tensor(self.tokenizer.encode(
             self.UNCONDITIONAL_START_TOKEN)).to(self.device).unsqueeze(0)
@@ -149,6 +265,9 @@ class BiasEvaluator(object):
 
         if self.PRETRAINED_CLASS == "gpt2-xl":
             model = amp.initialize(model, opt_level="O3")
+
+        # TODO:michael - add registration of erase neuron hooks
+
 
         start_token = torch.tensor(self.tokenizer.encode(
             self.UNCONDITIONAL_START_TOKEN)).to(self.device).unsqueeze(0)
@@ -314,6 +433,6 @@ if __name__ == "__main__":
     evaluator = BiasEvaluator(**vars(args))
     results = evaluator.evaluate()
     output_file = os.path.join(
-        args.output_dir, f"predictions_{args.pretrained_class}_{args.intersentence_model}_{args.intrasentence_model}.json")
-    with open(output_file, "w+") as f:
+        args.output_dir, f"predictions_{args.pretrained_class}_{args.intersentence_model}_{args.intrasentence_model}_erase_{args.erase_top_k}.json")
+    with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
